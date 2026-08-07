@@ -8,8 +8,12 @@ import (
 type GlobalConfView struct {
 	*walk.GroupBox
 
-	PinTimeoutEdit    *walk.LineEdit
-	NotificationsEdit *walk.CheckBox
+	PinTimeoutEdit           *walk.LineEdit
+	PinTimeoutOverrideSelect *walk.ComboBox
+	PinTimeoutOverrideStart  *walk.PushButton
+	PinTimeoutOverrideCancel *walk.PushButton
+	PinTimeoutOverrideStatus *walk.TextLabel
+	NotificationsEdit        *walk.CheckBox
 }
 
 func NewGlobalConfView(parent walk.Container) (*GlobalConfView, error) {
@@ -48,12 +52,63 @@ func NewGlobalConfView(parent walk.Container) (*GlobalConfView, error) {
 	gcv.PinTimeoutEdit.SetText("0")
 	gcv.PinTimeoutEdit.SetAlignment(walk.AlignHFarVFar)
 
+	// Setup the temporary permanent-cache override controls.
+	overrideLabel, err := walk.NewTextLabel(gcv)
+	if err != nil {
+		return nil, err
+	}
+	layout.SetRange(overrideLabel, walk.Rectangle{0, 1, 1, 1})
+	overrideLabel.SetTextAlignment(walk.AlignHNearVCenter)
+	overrideLabel.SetText(fmt.Sprintf("&Temporary -1 Override:"))
+	overrideLabel.SetToolTipText("Temporarily treat the configured PIN cache duration as -1. This setting is kept in memory only.")
+
+	overrideControls, err := walk.NewComposite(gcv)
+	if err != nil {
+		return nil, err
+	}
+	layout.SetRange(overrideControls, walk.Rectangle{1, 1, 1, 1})
+	overrideControls.SetLayout(walk.NewHBoxLayout())
+	overrideControls.Layout().SetMargins(walk.Margins{})
+
+	if gcv.PinTimeoutOverrideSelect, err = walk.NewDropDownBox(overrideControls); err != nil {
+		return nil, err
+	}
+	gcv.PinTimeoutOverrideSelect.SetModel(pinTimeoutOverrideLabels)
+	gcv.PinTimeoutOverrideSelect.SetCurrentIndex(0)
+	gcv.PinTimeoutOverrideSelect.SetMinMaxSizePixels(walk.Size{Width: 130}, walk.Size{})
+
+	if gcv.PinTimeoutOverrideStart, err = walk.NewPushButton(overrideControls); err != nil {
+		return nil, err
+	}
+	gcv.PinTimeoutOverrideStart.SetText("&Start")
+
+	if gcv.PinTimeoutOverrideCancel, err = walk.NewPushButton(overrideControls); err != nil {
+		return nil, err
+	}
+	gcv.PinTimeoutOverrideCancel.SetText("S&top")
+	gcv.PinTimeoutOverrideCancel.SetEnabled(false)
+
+	overrideStatusLabel, err := walk.NewTextLabel(gcv)
+	if err != nil {
+		return nil, err
+	}
+	layout.SetRange(overrideStatusLabel, walk.Rectangle{0, 2, 1, 1})
+	overrideStatusLabel.SetTextAlignment(walk.AlignHNearVCenter)
+	overrideStatusLabel.SetText(fmt.Sprintf("Override Status:"))
+
+	if gcv.PinTimeoutOverrideStatus, err = walk.NewTextLabel(gcv); err != nil {
+		return nil, err
+	}
+	layout.SetRange(gcv.PinTimeoutOverrideStatus, walk.Rectangle{1, 2, 1, 1})
+	gcv.PinTimeoutOverrideStatus.SetTextAlignment(walk.AlignHNearVCenter)
+	gcv.PinTimeoutOverrideStatus.SetText("Inactive")
+
 	//Setup the notifications checkbox
 	notificationLabel, err := walk.NewTextLabel(gcv)
 	if err != nil {
 		return nil, err
 	}
-	layout.SetRange(notificationLabel, walk.Rectangle{0, 1, 1, 1})
+	layout.SetRange(notificationLabel, walk.Rectangle{0, 3, 1, 1})
 	notificationLabel.SetTextAlignment(walk.AlignHNearVCenter)
 	notificationLabel.SetText(fmt.Sprintf("&Show Notifications:"))
 	notificationLabel.SetToolTipText("Show toast notifications when a key operation succeeds or fails.")
@@ -61,7 +116,7 @@ func NewGlobalConfView(parent walk.Container) (*GlobalConfView, error) {
 	if gcv.NotificationsEdit, err = walk.NewCheckBox(gcv); err != nil {
 		return nil, err
 	}
-	layout.SetRange(gcv.NotificationsEdit, walk.Rectangle{1, 1, 1, 1})
+	layout.SetRange(gcv.NotificationsEdit, walk.Rectangle{1, 3, 1, 1})
 	gcv.NotificationsEdit.SetChecked(true)
 	gcv.NotificationsEdit.SetAlignment(walk.AlignHFarVFar)
 

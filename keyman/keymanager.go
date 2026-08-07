@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -93,6 +94,12 @@ type KeyManagerConfig struct {
 	USBEvents            bool         `json:"usbEvents,omitempty"`
 }
 
+type PinTimeoutOverrideStatus struct {
+	Active       bool
+	UntilRestart bool
+	ExpiresAt    time.Time
+}
+
 type Key struct {
 	Name                 string
 	Type                 string
@@ -107,7 +114,6 @@ type Key struct {
 	length    int
 
 	config *KeyConfig
-	handle uintptr
 	signer *crypto.Signer
 	hwnd   uintptr
 
@@ -122,7 +128,7 @@ func (k *Key) TakeFocus() bool {
 	if !k.config.NoPin && k.hwnd != 0 {
 		if k.Type == "NCRYPT" && k.signer != nil {
 			if ncryptSigner, ok := (*k.signer).(*Signer); ok {
-				if ncryptSigner.timeractive {
+				if ncryptSigner.PINCacheActive() {
 					return false
 				}
 			}
@@ -269,10 +275,11 @@ func (k *Key) ContainerName() string {
 }
 
 func (k *Key) Close() {
-	if k.handle != 0 {
-		ncrypt.NCryptFreeObject(k.handle)
+	if k.Type == "NCRYPT" && k.signer != nil {
+		if ncryptSigner, ok := (*k.signer).(*Signer); ok {
+			ncryptSigner.Close()
+		}
 	}
-	k.handle = 0
 }
 
 func (k *Key) SignSSH(b []byte) (*ssh.Signature, error) {
@@ -445,10 +452,11 @@ func (k *Key) signWebAuthN(signData []byte) (*ssh.Signature, error) {
 }
 
 func (k *Key) SetHWND(hwnd uintptr) {
-	if k.Type == "NCRYPT" && k.handle != 0 {
-		err := ncrypt.NCryptSetProperty(k.handle, ncrypt.NCRYPT_WINDOW_HANDLE_PROPERTY, hwnd, 0)
-		if err != nil {
-			log.Printf("Setting NCryptWindow handle failed: %v", err)
+	if k.Type == "NCRYPT" && k.signer != nil {
+		if ncryptSigner, ok := (*k.signer).(*Signer); ok {
+			if err := ncryptSigner.SetHWND(hwnd); err != nil {
+				log.Printf("Setting NCryptWindow handle failed: %v", err)
+			}
 		}
 	}
 	k.hwnd = hwnd
@@ -487,6 +495,14 @@ type KeyManager struct {
 	pageantListener   *listeners.Pageant
 	sshAgent          KeyManagerAgent
 	notifyChan        chan NotifyMsg
+
+	pinTimeoutMu                   sync.Mutex
+	pinTimeoutOverrideActive       bool
+	pinTimeoutOverrideUntilRestart bool
+	pinTimeoutOverrideExpiresAt    time.Time
+	pinTimeoutOverrideTimer        *time.Timer
+	pinTimeoutOverrideGeneration   uint64
+	pinTimeoutOverrideSigners      map[*Signer]struct{}
 }
 
 func NewKeyManager(configPath string) (*KeyManager, error) {
@@ -614,7 +630,6 @@ func (km *KeyManager) Start() error {
 				SSHPublicKey:         nil,
 				SSHPublicKeyLocation: "",
 				config:               k,
-				handle:               0,
 				LoadError:            err,
 				Missing:              true,
 			}
@@ -722,22 +737,16 @@ func (km *KeyManager) LoadNCryptKey(kc *KeyConfig) (*Key, error) {
 		return nil, err
 	}
 
-	// silently determine if the key is available
+	// The parent process only opens the key silently to read public metadata.
+	// Private-key operations are performed by the signer subprocess.
 	keyHandle, err := ncrypt.NCryptOpenKey(providerHandle, kc.ContainerName, 0, ncrypt.NCRYPT_SILENT_FLAG)
 	if err != nil {
 		return nil, err
 	}
-
-	// close and reopen the handle allowing user interaction now
-	ncrypt.NCryptFreeObject(keyHandle)
-	keyHandle, err = ncrypt.NCryptOpenKey(providerHandle, kc.ContainerName, 0, 0)
-	if err != nil {
-		return nil, err
-	}
+	defer ncrypt.NCryptFreeObject(keyHandle)
 
 	algorithmName, err := ncrypt.NCryptGetPropertyStr(keyHandle, ncrypt.NCRYPT_ALGORITHM_PROPERTY)
 	if err != nil {
-		ncrypt.NCryptFreeObject(keyHandle)
 		return nil, err
 	}
 
@@ -752,17 +761,16 @@ func (km *KeyManager) LoadNCryptKey(kc *KeyConfig) (*Key, error) {
 		}
 	}
 
-	signer, err := newNCryptSigner(keyHandle, km.config.PinTimeout)
+	signer, err := newNCryptSigner(keyHandle, km.GetPinTimeout(), kc.ProviderName, kc.ContainerName)
 	if err != nil {
-		ncrypt.NCryptFreeObject(keyHandle)
 		return nil, err
 	}
 
 	sshPub, err := ssh.NewPublicKey(signer.Public())
 	if err != nil {
-		ncrypt.NCryptFreeObject(keyHandle)
 		return nil, err
 	}
+	km.registerNCryptSigner(signer)
 
 	sshPub.Type()
 
@@ -774,7 +782,6 @@ func (km *KeyManager) LoadNCryptKey(kc *KeyConfig) (*Key, error) {
 		SSHPublicKey:         &sshPub,
 		SSHPublicKeyLocation: "",
 		config:               kc,
-		handle:               keyHandle,
 		LoadError:            nil,
 		signer:               &signer,
 		Missing:              false,
@@ -844,12 +851,12 @@ func (km *KeyManager) CreateNewNCryptKey(keyName string, containerName string, p
 	if err != nil {
 		return nil, fmt.Errorf("unable to create persisted key: %w", err)
 	}
+	defer ncrypt.NCryptFreeObject(kh)
 
 	if algorithm == ncrypt.ALG_RSA {
 		err = ncrypt.NCryptSetProperty(kh, ncrypt.NCRYPT_LENGTH_PROPERTY, uint32(bits), 0)
 
 		if err != nil {
-			ncrypt.NCryptFreeObject(kh)
 			return nil, fmt.Errorf("unable to set key NCRYPT_LENGTH_PROPERTY: %w", err)
 		}
 	}
@@ -876,27 +883,24 @@ func (km *KeyManager) CreateNewNCryptKey(keyName string, containerName string, p
 
 	err = ncrypt.NCryptFinalizeKey(kh, 0)
 	if err != nil {
-		ncrypt.NCryptFreeObject(kh)
 		return nil, fmt.Errorf("unable to finalize key: %w", err)
 	}
 
 	uc, err := ncrypt.NCryptGetPropertyStr(kh, ncrypt.NCRYPT_UNIQUE_NAME_PROPERTY)
 	if err != nil {
-		ncrypt.NCryptFreeObject(kh)
 		return nil, fmt.Errorf("unable to retrieve NCRYPT_UNIQUE_NAME_PROPERTY: %w", err)
 	}
 
-	signer, err := newNCryptSigner(kh, km.config.PinTimeout)
+	signer, err := newNCryptSigner(kh, km.GetPinTimeout(), providerName, uc)
 	if err != nil {
-		ncrypt.NCryptFreeObject(kh)
 		return nil, err
 	}
 
 	sshPub, err := ssh.NewPublicKey(signer.Public())
 	if err != nil {
-		ncrypt.NCryptFreeObject(kh)
 		return nil, err
 	}
+	km.registerNCryptSigner(signer)
 
 	kc := KeyConfig{
 		Name:          keyName,
@@ -916,7 +920,6 @@ func (km *KeyManager) CreateNewNCryptKey(keyName string, containerName string, p
 		SSHPublicKey:         &sshPub,
 		SSHPublicKeyLocation: "",
 		config:               &kc,
-		handle:               kh,
 		signer:               &signer,
 		Missing:              false,
 	}
@@ -928,11 +931,6 @@ func (km *KeyManager) CreateNewNCryptKey(keyName string, containerName string, p
 	k.LoadCertificate("")
 
 	err = km.SaveConfig()
-
-	// empty the password so we are prompted on first use
-	if password != "" {
-		ncrypt.NCryptSetProperty(kh, ncrypt.NCRYPT_PIN_PROPERTY, "", 0)
-	}
 
 	return &k, err
 }
@@ -1169,7 +1167,6 @@ func (km *KeyManager) CreateNewWebAuthNKey(keyName string, application string, c
 			VerifyRequired: verifyRequired,
 			NoPin:          false,
 		},
-		handle: 0,
 		signer: nil,
 	}
 
@@ -1199,6 +1196,16 @@ func (km *KeyManager) KeysList() []*Key {
 }
 
 func (km *KeyManager) Close() {
+	km.pinTimeoutMu.Lock()
+	km.pinTimeoutOverrideGeneration++
+	if km.pinTimeoutOverrideTimer != nil {
+		km.pinTimeoutOverrideTimer.Stop()
+		km.pinTimeoutOverrideTimer = nil
+	}
+	km.pinTimeoutOverrideActive = false
+	km.pinTimeoutOverrideSigners = nil
+	km.pinTimeoutMu.Unlock()
+
 	for _, k := range km.Keys {
 		k.Close()
 	}
@@ -1231,43 +1238,230 @@ func (km *KeyManager) SaveConfig() error {
 
 	km.config.Keys = keyConfigs
 	jsonString, err := json.MarshalIndent(km.config, "", "    ")
+	if err != nil {
+		return err
+	}
 
 	f, err := os.OpenFile(km.configPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(jsonString)
-	f.Close()
+	if _, err = f.Write(jsonString); err != nil {
+		_ = f.Close()
+		return err
+	}
 
-	return err
+	return f.Close()
 }
 
 func (km *KeyManager) DeleteKey(keyToDelete *Key, deleteFromKeystore bool) error {
 	log.Printf("Deleting %s - from keystore %v\n", keyToDelete.Name, deleteFromKeystore)
 
 	if deleteFromKeystore && keyToDelete.Type == "NCRYPT" {
-		err := ncrypt.NCryptDeleteKey(keyToDelete.handle, 0)
-
-		if err != nil {
-			log.Printf("err: %s", err)
-			return err
+		if keyToDelete.signer == nil {
+			return fmt.Errorf("cannot delete unavailable NCrypt key %s", keyToDelete.Name)
+		}
+		if ncryptSigner, ok := (*keyToDelete.signer).(*Signer); ok {
+			if err := ncryptSigner.DeleteKey(); err != nil {
+				log.Printf("err: %s", err)
+				return err
+			}
+		} else {
+			return fmt.Errorf("cannot delete NCrypt key %s with signer type %T", keyToDelete.Name, *keyToDelete.signer)
 		}
 	}
+	keyToDelete.Close()
+	km.unregisterNCryptSigner(keyToDelete)
 
 	delete(km.Keys, keyToDelete.Name)
 
 	return km.SaveConfig()
 }
 
-func (km *KeyManager) SetPinTimeout(timeout int) {
-	km.config.PinTimeout = timeout
-	for _, k := range km.Keys {
-		k.SetTimeout(timeout)
+func (km *KeyManager) SetPinTimeout(timeout int) error {
+	if timeout < -1 {
+		return fmt.Errorf("PIN cache duration must be -1, 0, or a positive number of seconds")
 	}
+
+	signers := km.ncryptSigners()
+	km.pinTimeoutMu.Lock()
+	previousTimeout := km.config.PinTimeout
+	km.config.PinTimeout = timeout
+	if err := km.SaveConfig(); err != nil {
+		km.config.PinTimeout = previousTimeout
+		km.pinTimeoutMu.Unlock()
+		return fmt.Errorf("unable to save PIN cache duration: %w", err)
+	}
+
+	effectiveTimeout := timeout
+	if km.pinTimeoutOverrideActive {
+		effectiveTimeout = -1
+		km.ensurePinTimeoutOverrideSignersLocked()
+	}
+	for _, signer := range signers {
+		if km.pinTimeoutOverrideActive {
+			km.pinTimeoutOverrideSigners[signer] = struct{}{}
+		}
+		signer.SetPINTimeout(effectiveTimeout)
+	}
+	km.pinTimeoutMu.Unlock()
+
+	return nil
 }
 
 func (km *KeyManager) GetPinTimeout() int {
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
 	return km.config.PinTimeout
+}
+
+func (km *KeyManager) StartPinTimeoutOverride(duration time.Duration) error {
+	if duration <= 0 {
+		return fmt.Errorf("PIN timeout override duration must be positive")
+	}
+
+	km.startPinTimeoutOverride(duration, false)
+	return nil
+}
+
+func (km *KeyManager) StartPinTimeoutOverrideForLifetime() {
+	km.startPinTimeoutOverride(0, true)
+}
+
+func (km *KeyManager) CancelPinTimeoutOverride() {
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
+
+	if !km.pinTimeoutOverrideActive {
+		return
+	}
+
+	km.clearPinTimeoutOverrideLocked()
+	log.Printf("Temporary permanent PIN cache override cancelled; restored configured timeout %ds\n", km.config.PinTimeout)
+}
+
+func (km *KeyManager) GetPinTimeoutOverrideStatus() PinTimeoutOverrideStatus {
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
+
+	return PinTimeoutOverrideStatus{
+		Active:       km.pinTimeoutOverrideActive,
+		UntilRestart: km.pinTimeoutOverrideUntilRestart,
+		ExpiresAt:    km.pinTimeoutOverrideExpiresAt,
+	}
+}
+
+func (km *KeyManager) startPinTimeoutOverride(duration time.Duration, untilRestart bool) {
+	signers := km.ncryptSigners()
+
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
+
+	km.pinTimeoutOverrideGeneration++
+	if km.pinTimeoutOverrideTimer != nil {
+		km.pinTimeoutOverrideTimer.Stop()
+		km.pinTimeoutOverrideTimer = nil
+	}
+
+	km.pinTimeoutOverrideActive = true
+	km.pinTimeoutOverrideUntilRestart = untilRestart
+	km.pinTimeoutOverrideExpiresAt = time.Time{}
+	km.pinTimeoutOverrideSigners = make(map[*Signer]struct{}, len(signers))
+	for _, signer := range signers {
+		km.pinTimeoutOverrideSigners[signer] = struct{}{}
+		signer.SetPINTimeout(-1)
+	}
+
+	if untilRestart {
+		log.Printf("Temporary permanent PIN cache override active until nCryptAgent restarts\n")
+		return
+	}
+
+	km.pinTimeoutOverrideExpiresAt = time.Now().Add(duration)
+	generation := km.pinTimeoutOverrideGeneration
+	km.pinTimeoutOverrideTimer = time.AfterFunc(duration, func() {
+		km.expirePinTimeoutOverride(generation)
+	})
+	log.Printf("Temporary permanent PIN cache override active for %s\n", duration)
+}
+
+func (km *KeyManager) expirePinTimeoutOverride(generation uint64) {
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
+
+	if !km.pinTimeoutOverrideActive || generation != km.pinTimeoutOverrideGeneration {
+		return
+	}
+
+	km.clearPinTimeoutOverrideLocked()
+	log.Printf("Temporary permanent PIN cache override expired; restored configured timeout %ds\n", km.config.PinTimeout)
+}
+
+func (km *KeyManager) clearPinTimeoutOverrideLocked() {
+	km.pinTimeoutOverrideGeneration++
+	if km.pinTimeoutOverrideTimer != nil {
+		km.pinTimeoutOverrideTimer.Stop()
+		km.pinTimeoutOverrideTimer = nil
+	}
+
+	km.pinTimeoutOverrideActive = false
+	km.pinTimeoutOverrideUntilRestart = false
+	km.pinTimeoutOverrideExpiresAt = time.Time{}
+	for signer := range km.pinTimeoutOverrideSigners {
+		signer.SetPINTimeout(km.config.PinTimeout)
+	}
+	km.pinTimeoutOverrideSigners = nil
+}
+
+func (km *KeyManager) registerNCryptSigner(signer crypto.Signer) {
+	ncryptSigner, ok := signer.(*Signer)
+	if !ok {
+		return
+	}
+
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
+
+	effectiveTimeout := km.config.PinTimeout
+	if km.pinTimeoutOverrideActive {
+		effectiveTimeout = -1
+		km.ensurePinTimeoutOverrideSignersLocked()
+		km.pinTimeoutOverrideSigners[ncryptSigner] = struct{}{}
+	}
+	ncryptSigner.SetPINTimeout(effectiveTimeout)
+}
+
+func (km *KeyManager) unregisterNCryptSigner(key *Key) {
+	if key.Type != "NCRYPT" || key.signer == nil {
+		return
+	}
+	ncryptSigner, ok := (*key.signer).(*Signer)
+	if !ok {
+		return
+	}
+
+	km.pinTimeoutMu.Lock()
+	defer km.pinTimeoutMu.Unlock()
+	delete(km.pinTimeoutOverrideSigners, ncryptSigner)
+}
+
+func (km *KeyManager) ensurePinTimeoutOverrideSignersLocked() {
+	if km.pinTimeoutOverrideSigners == nil {
+		km.pinTimeoutOverrideSigners = make(map[*Signer]struct{})
+	}
+}
+
+func (km *KeyManager) ncryptSigners() []*Signer {
+	signers := make([]*Signer, 0)
+	for _, key := range km.Keys {
+		if key.Type != "NCRYPT" || key.signer == nil {
+			continue
+		}
+		if signer, ok := (*key.signer).(*Signer); ok {
+			signers = append(signers, signer)
+		}
+	}
+	return signers
 }
 func (km *KeyManager) GetUSBEventsEnabled() bool {
 	return km.config.USBEvents
@@ -1389,7 +1583,7 @@ func (km *KeyManager) LoadWebAuthNKey(kc *KeyConfig) (*Key, error) {
 	out, _, _, _, err := ssh.ParseAuthorizedKey([]byte(kc.SSHPublicKey))
 
 	if err != nil {
-		log.Printf("Error parsing authorized: %w\n", err)
+		log.Printf("Error parsing authorized: %v\n", err)
 		return nil, err
 	}
 
@@ -1402,7 +1596,6 @@ func (km *KeyManager) LoadWebAuthNKey(kc *KeyConfig) (*Key, error) {
 		LoadError:      nil,
 		algorithm:      "",
 		config:         kc,
-		handle:         0,
 		signer:         nil,
 	}
 
