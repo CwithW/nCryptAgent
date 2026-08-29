@@ -153,6 +153,9 @@ func (mkw *ManageKeysWindow) WndProc(hwnd win.HWND, msg uint32, wParam, lParam u
 				log.Printf("Error decoding device information: %s", err)
 				return 0
 			}
+			if deviceType != deviceevents.DBT_DEVTYP_DEVICEINTERFACE {
+				return 0
+			}
 
 			if deviceGUID == deviceevents.SMARTCARD_DEVICE_CLASS {
 				log.Printf("Smartcard insert/remove detected: Type: %d, GUID: %v, name: %s\n", deviceType, deviceGUID, deviceName)

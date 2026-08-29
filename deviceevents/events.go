@@ -1,10 +1,9 @@
 package deviceevents
 
 import (
-	"bytes"
 	"encoding/binary"
+	"fmt"
 	"golang.org/x/sys/windows"
-	"reflect"
 	"unsafe"
 )
 
@@ -19,7 +18,12 @@ const (
 
 	DEVICE_NOTIFY_WINDOW_HANDLE         = 0x0
 	DEVICE_NOTIFY_ALL_INTERFACE_CLASSES = 0x00000004
+	DBT_DEVTYP_VOLUME                   = 0x00000002 // logical volume
 	DBT_DEVTYP_DEVICEINTERFACE          = 0x00000005 // device interface class
+
+	deviceBroadcastHeaderSize          = 12
+	deviceBroadcastDeviceInterfaceSize = 28
+	maxDeviceBroadcastSize             = 64 * 1024
 )
 
 var (
@@ -61,37 +65,60 @@ func RegisterDeviceNotification(hwnd windows.HWND) error {
 }
 
 func ReadDeviceInfo(devInfoPtr uintptr) (uint32, windows.GUID, string, error) {
-	var devInfo struct {
-		dbccSize       uint32
-		dbccDeviceType uint32
-		dbccReserved   uint32
-		GUID           windows.GUID
+	if devInfoPtr == 0 {
+		return 0, windows.GUID{}, "", fmt.Errorf("device information pointer is nil")
 	}
 
-	var err error
+	header := unsafe.Slice((*byte)(unsafe.Pointer(devInfoPtr)), deviceBroadcastHeaderSize)
+	declaredSize := binary.LittleEndian.Uint32(header[0:4])
+	deviceType := binary.LittleEndian.Uint32(header[4:8])
 
-	var devInfoBytes []byte
-	slice := (*reflect.SliceHeader)(unsafe.Pointer(&devInfoBytes))
-	slice.Data = devInfoPtr
-	slice.Len = int(uint32(unsafe.Sizeof(devInfo)))
-	slice.Cap = int(uint32(unsafe.Sizeof(devInfo)))
-
-	reader := bytes.NewReader(devInfoBytes)
-	// TODO: ARM might need to use different endianness
-	err = binary.Read(reader, binary.LittleEndian, &devInfo.dbccSize)
-	err = binary.Read(reader, binary.LittleEndian, &devInfo.dbccDeviceType)
-	err = binary.Read(reader, binary.LittleEndian, &devInfo.dbccReserved)
-	err = binary.Read(reader, binary.LittleEndian, &devInfo.GUID)
-
-	if err != nil {
-		return 0, windows.GUID{}, "", err
+	if declaredSize < deviceBroadcastHeaderSize {
+		return 0, windows.GUID{}, "", fmt.Errorf("device information size %d is smaller than the header", declaredSize)
 	}
 
-	var devNameBytes []byte
-	devNameSlice := (*reflect.SliceHeader)(unsafe.Pointer(&devNameBytes))
-	devNameSlice.Data = devInfoPtr + unsafe.Sizeof(devInfo)
-	devNameSlice.Len = int(devInfo.dbccSize - uint32(unsafe.Sizeof(devInfo)))
-	devNameSlice.Cap = int(devInfo.dbccSize - uint32(unsafe.Sizeof(devInfo)))
+	// WM_DEVICECHANGE broadcasts use different structures for each device type.
+	// Only DEV_BROADCAST_DEVICEINTERFACE contains a class GUID and device name.
+	if deviceType != DBT_DEVTYP_DEVICEINTERFACE {
+		return deviceType, windows.GUID{}, "", nil
+	}
 
-	return devInfo.dbccDeviceType, devInfo.GUID, string(devNameBytes), nil
+	if declaredSize > maxDeviceBroadcastSize {
+		return 0, windows.GUID{}, "", fmt.Errorf("device information size %d exceeds the maximum supported size", declaredSize)
+	}
+
+	deviceInfo := unsafe.Slice((*byte)(unsafe.Pointer(devInfoPtr)), int(declaredSize))
+	return parseDeviceInfo(deviceInfo)
+}
+
+func parseDeviceInfo(deviceInfo []byte) (uint32, windows.GUID, string, error) {
+	if len(deviceInfo) < deviceBroadcastHeaderSize {
+		return 0, windows.GUID{}, "", fmt.Errorf("device information is shorter than the header")
+	}
+
+	declaredSize := binary.LittleEndian.Uint32(deviceInfo[0:4])
+	deviceType := binary.LittleEndian.Uint32(deviceInfo[4:8])
+	if declaredSize < deviceBroadcastHeaderSize {
+		return 0, windows.GUID{}, "", fmt.Errorf("device information size %d is smaller than the header", declaredSize)
+	}
+	if declaredSize > uint32(len(deviceInfo)) {
+		return 0, windows.GUID{}, "", fmt.Errorf("device information size %d exceeds available data %d", declaredSize, len(deviceInfo))
+	}
+	if deviceType != DBT_DEVTYP_DEVICEINTERFACE {
+		return deviceType, windows.GUID{}, "", nil
+	}
+	if declaredSize < deviceBroadcastDeviceInterfaceSize {
+		return 0, windows.GUID{}, "", fmt.Errorf("device interface size %d is smaller than the fixed structure", declaredSize)
+	}
+
+	guidBytes := deviceInfo[12:deviceBroadcastDeviceInterfaceSize]
+	deviceGUID := windows.GUID{
+		Data1: binary.LittleEndian.Uint32(guidBytes[0:4]),
+		Data2: binary.LittleEndian.Uint16(guidBytes[4:6]),
+		Data3: binary.LittleEndian.Uint16(guidBytes[6:8]),
+	}
+	copy(deviceGUID.Data4[:], guidBytes[8:16])
+
+	deviceName := string(deviceInfo[deviceBroadcastDeviceInterfaceSize:declaredSize])
+	return deviceType, deviceGUID, deviceName, nil
 }
