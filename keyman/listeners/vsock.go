@@ -137,7 +137,7 @@ func (s *vSockWorker) Run() {
 			return
 		}
 		go func() {
-			agent.ServeAgent(s.sshagent, conn)
+			serveAgentConnection(s.sshagent, conn)
 		}()
 	}
 }
@@ -250,7 +250,7 @@ func (s *VSock) Run(ctx context.Context, sshagent agent.Agent) error {
 		}
 		wg.Add(1)
 		go func() {
-			err := agent.ServeAgent(sshagent, conn)
+			err := serveAgentConnection(sshagent, conn)
 			if err != nil && err != io.EOF {
 				log.Println(err.Error())
 			}

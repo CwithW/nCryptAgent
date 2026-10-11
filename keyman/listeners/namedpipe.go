@@ -66,7 +66,7 @@ func (s *NamedPipe) Run(ctx context.Context, sshagent agent.Agent) error {
 		}
 		wg.Add(1)
 		go func() {
-			s.lastError = agent.ServeAgent(sshagent, conn)
+			s.lastError = serveAgentConnection(sshagent, conn)
 			if s.lastError != nil && s.lastError != io.EOF {
 				log.Println(s.lastError.Error())
 			}

@@ -169,7 +169,7 @@ func (s *Cygwin) Run(ctx context.Context, sshagent agent.Agent) error {
 		}
 		wg.Add(1)
 		go func() {
-			err := agent.ServeAgent(sshagent, conn)
+			err := serveAgentConnection(sshagent, conn)
 			if err != nil && err != io.EOF {
 				log.Println(err.Error())
 			}
